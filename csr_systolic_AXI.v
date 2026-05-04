@@ -20,14 +20,22 @@
 // 0x30 CTRL -> [0] (route_en/START), [1] (reg_clear)
 // 0x34 STATUS -> [0] read_only, o_done
 // 0x38 quant_sh -> quantization right shift amount
-// 0x3C quant_mult
+//
+// NOTE: quant_scale and quant_bias are NOT in the CSR.
+//       They are per-channel arrays stored in scale_spad and bias_spad,
+//       loaded by the DMA (spad_select=011 and 010), read by output router
+//       internally via quant_addr/quant_read_en. CSR has no role there.
+//
 // https://developer.arm.com/documentation/ihi0022/k/ 
 //////////////////////////////////////////////////////////////////////////////////
 
 `timescale 1ns/1ps
 module systolic_csr #(
-    parameter DATA_WIDTH = 8,
-    parameter ADDR_WIDTH = 32
+    parameter DATA_WIDTH = 8,  // this is supposed to be SHIFT_WIDTH
+    parameter ADDR_WIDTH = 32,
+    
+    parameter SCALE_WIDTH = 16, // width of the quant_scale, but this should come from the SPAD
+    parameter BIAS_WIDTH = 32   // width of the quant_bias 
 )(
     input wire clk, nrst,
     
@@ -75,8 +83,7 @@ module systolic_csr #(
     output reg                    o_reg_clear,   // i_reg_clear (flush)
 
     // --- Quantization Outputs to top.sv systolic ---
-    output reg  [DATA_WIDTH-1:0]   o_quant_sh,
-    output reg  [2*DATA_WIDTH-1:0] o_quant_mult
+    output reg  [DATA_WIDTH-1:0]   o_quant_sh
     );
 
     // --- AXI Write ---
@@ -99,8 +106,8 @@ module systolic_csr #(
             o_i_start_addr <= 0; o_i_addr_end  <= 0;
             o_w_start_addr <= 0; o_w_addr_end  <= 0;
             o_route_en     <= 0; o_reg_clear   <= 0;
-            o_quant_sh <= 8'h05; o_quant_mult  <= 16'h9c8c; // make the hardcoded top.sv systolic values the default 
-        
+            // Default matches hardcoded quant_sh in original top.sv
+            o_quant_sh <= {{(DATA_WIDTH-8){1'b0}}, 8'h05};
         end else begin
             s_axil_awready <= 0;
             s_axil_wready  <= 0;
@@ -143,13 +150,6 @@ module systolic_csr #(
                         // only the DATA_WIDTH bits are used, and the upper bits are ignored
                         o_quant_sh        <= s_axil_wdata[DATA_WIDTH-1:0];     
                     end
-                    6'h0F: begin
-                        // 0x3C where 16 bit fixed point multipler for DATA_WIDTH
-                        // CPU writes the full value in wdata[15:0]
-                        // Value is pre-computed, stored in the DRAM
-                        // Write this before the route_en bit
-                        o_quant_mult      <= s_axil_wdata[2*DATA_WIDTH-1:0];
-                    end
                     default: ; // no specific default, unmapped
                 endcase
                 s_axil_bvalid <= 1;
@@ -190,7 +190,6 @@ module systolic_csr #(
                     6'h0C: s_axil_rdata <= 32'd0;           // CTRL is write-only
                     6'h0D: s_axil_rdata <= {31'd0, i_done}; // STATUS — CPU polls here
                     6'h0E: s_axil_rdata <= {{(32-DATA_WIDTH){1'b0}}, o_quant_sh};
-                    6'h0F: s_axil_rdata <= {{(32 - 2*DATA_WIDTH){1'b0}}, o_quant_mult};
     
                     default: s_axil_rdata <= 32'hB0BACAFE;  // unmapped, debug sentinel
                 endcase
