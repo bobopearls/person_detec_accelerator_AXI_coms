@@ -12,14 +12,18 @@
 //     `define MPP_DEPTH 9
 
 // Register mapped channels, base = channel_index * 'h20
-//   +0x00  SRC_ADDR  [31:0]   source address
+//   +0x00  SRC_ADDR0 [31:0]   source address
 //   +0x04  DST_ADDR  [31:0]   destination address
 //   +0x08  BYTE_LEN  [31:0]   transfer length in bytes
 //   +0x0C  CTRL      [31:0]   bit0=START (auto-clears), bit1=reserved
 //   +0x10  STATUS    [31:0]   bit0=BUSY, bit1=DONE (W1C)
-
+//   +0x14  SPAD_SEL  o[2:0]   target SPAD for this transfer:
+//                             000=weights 001=ifmaps 010=bias
+//                             011=scale   100=shift
 // Btw here is the reference for the initial set up: https://github.com/donlon/axi-dma-controller/tree/main
 // Paper refence that I use more (this is really good!!!): https://jtec.utem.edu.my/jtec/article/view/5774
+
+// Another note: W1C means write 1 to clear
 
 `timescale 1 ns / 1 ps
 module DMA_Controller #(
@@ -79,17 +83,23 @@ module DMA_Controller #(
 
         input wire [1:0]              M_AXI_BRESP, 
         input wire                    M_AXI_BVALID, // confirm that the data is valid and ready
-        output reg                    M_AXI_BREADY
+        output reg                    M_AXI_BREADY,
     
         // --- CPU Interrupt Signal ---
         // after the DMA is done send the interrupt req to the processor
         //output reg [NUM_CHANNEL-1 : 0] interrupt_req // note: need to replace this maybe to fit the polling feature
+        
+        // SPAD select: valid during S_WDATA, tells top.sv which SPAD to write to
+        // Encoding: 000=weights 001=ifmaps 010=bias 011=scale 100=shift
+        output wire [2:0]  M_SPAD_SEL
     );
         // Constants 
         localparam BPB  = DATA_WIDTH / 8;           // bytes per beat = 8
         localparam BMAX = MAX_AXI_BURST * BPB;      // max bytes per burst = 256
         localparam LBPB = $clog2(BPB);              // log base 2 (8) = 3 for the ARSIZE, AWSIZE
-         
+        
+        // Register select indices (bits [4:2] of AXI-Lite address)
+        localparam [2:0] R_SRC=3'd0, R_DST=3'd1, R_LEN=3'd2, R_CTRL=3'd3, R_STATUS=3'd4, R_SPAD=3'd5;
         localparam [2:0]
             S_IDLE  = 3'd0, S_RADDR = 3'd1, S_RDATA = 3'd2,
             S_WADDR = 3'd3, S_WDATA = 3'd4, S_WRESP = 3'd5, S_DONE  = 3'd6;
@@ -98,15 +108,13 @@ module DMA_Controller #(
         // Channel description regs written by AXI-Lite slave (CPU side)
         // The master FSM never writes these, single writer per register.
         // ---------------------------------------------------------------------------
-        reg [31:0] cfg_src    [0:NUM_CHANNEL-1];
-        reg [31:0] cfg_dst    [0:NUM_CHANNEL-1];
-        reg [31:0] cfg_len    [0:NUM_CHANNEL-1];
-        reg [31:0] cfg_ctrl   [0:NUM_CHANNEL-1]; // bit0=START request, bit1=IRQ_EN not in use anymore
-        reg [31:0] reg_status [0:NUM_CHANNEL-1]; // bit0=BUSY, bit1=DONE (W1C)
+        reg [31:0] cfg_src      [0:NUM_CHANNEL-1];
+        reg [31:0] cfg_dst      [0:NUM_CHANNEL-1];
+        reg [31:0] cfg_len      [0:NUM_CHANNEL-1];
+        reg [31:0] cfg_ctrl     [0:NUM_CHANNEL-1]; // bit0=START request, bit1=IRQ_EN not in use anymore
+        reg [31:0] reg_status   [0:NUM_CHANNEL-1]; // bit0=BUSY, bit1=DONE (W1C)
+        reg [2:0]  cfg_spad_sel [0:NUM_CHANNEL-1]; // which SPAD this channel targets
         // cfg_ctrl[i][0] is SET by CPU write, CLEARED by master FSM handshake flag
-         
-        // Status register - written by master FSM only (single writer)
-        reg [31:0] reg_status [0:NUM_CHANNEL-1];
          
         // ---------------------------------------------------------------------------
         // AXI-Lite write path: only drives cfg_* registers
@@ -124,6 +132,7 @@ module DMA_Controller #(
                 for (i = 0; i < NUM_CHANNEL; i = i + 1) begin
                     cfg_src[i] <= 0; cfg_dst[i] <= 0;
                     cfg_len[i] <= 0; cfg_ctrl[i] <= 0;
+                    cfg_spad_sel[i] <= 3'b000;  // default to weights SPAD
                 end
             end else begin
                 s_axil_awready <= 0;
@@ -142,14 +151,15 @@ module DMA_Controller #(
                     aw_pend <= 0;
                     begin : wdec
                         reg [1:0] ch; reg [2:0] rg;
-                        ch = aw_lat[6:5]; // channel 0 to 3
-                        rg = aw_lat[4:2]; // register index
+                        ch = aw_lat[6:5];   // bits[6:5] → channel 0-3
+                        rg = aw_lat[4:2];   // bits[4:2] → register index
                         case (rg)
-                            3'd0: cfg_src[ch]  <= s_axil_wdata;
-                            3'd1: cfg_dst[ch]  <= s_axil_wdata;
-                            3'd2: cfg_len[ch]  <= s_axil_wdata;
-                            3'd3: cfg_ctrl[ch] <= s_axil_wdata; // START written here
-                            3'd4: reg_status[ch] <= reg_status[ch] & ~s_axil_wdata; // W1C
+                            R_SRC:    cfg_src[ch]    <= s_axil_wdata;
+                            R_DST:    cfg_dst[ch]    <= s_axil_wdata;
+                            R_LEN:    cfg_len[ch]    <= s_axil_wdata;
+                            R_CTRL:   cfg_ctrl[ch]     <= s_axil_wdata;
+                            R_STATUS: reg_status[ch]   <= reg_status[ch] & ~s_axil_wdata; // W1C
+                            R_SPAD:   cfg_spad_sel[ch] <= s_axil_wdata[2:0]; // 3 bits only
                             default: ;
                         endcase
                     end
@@ -178,12 +188,13 @@ module DMA_Controller #(
                         reg [2:0] rg;
                         ch = s_axil_araddr[6:5]; rg = s_axil_araddr[4:2];
                         case (rg)
-                            3'd0: s_axil_rdata <= cfg_src[ch];
-                            3'd1: s_axil_rdata <= cfg_dst[ch];
-                            3'd2: s_axil_rdata <= cfg_len[ch];
-                            3'd3: s_axil_rdata <= cfg_ctrl[ch];
-                            3'd4: s_axil_rdata <= reg_status[ch];
-                            default: s_axil_rdata <= 32'hB0BACAFE;
+                            R_SRC:    s_axil_rdata <= cfg_src[ch];
+                            R_DST:    s_axil_rdata <= cfg_dst[ch];
+                            R_LEN:    s_axil_rdata <= cfg_len[ch];
+                            R_CTRL:   s_axil_rdata <= cfg_ctrl[ch];
+                            R_STATUS: s_axil_rdata <= reg_status[ch];
+                            R_SPAD:   s_axil_rdata <= {29'd0, cfg_spad_sel[ch]};
+                            default:  s_axil_rdata <= 32'hB0BA_CAFE;
                         endcase
                     end
                     s_axil_rresp <= 2'b00; s_axil_rvalid <= 1;
@@ -212,6 +223,7 @@ module DMA_Controller #(
         reg [31:0] w_src [0:NUM_CHANNEL-1];
         reg [31:0] w_dst [0:NUM_CHANNEL-1];
         reg [31:0] w_rem [0:NUM_CHANNEL-1];   // remaining bytes
+        reg [2:0]  w_spad_sel [0:NUM_CHANNEL-1]; // snapshot of cfg_spad_sel at START
          
         // Beat FIFO, holds one full AXI Burst
         reg [DATA_WIDTH-1:0] fifo [0:MAX_AXI_BURST-1];
@@ -233,7 +245,7 @@ module DMA_Controller #(
                 fw <= 0; fr <= 0;
                 pending <= 0; //interrupt_req <= 0;
                 for (i = 0; i < NUM_CHANNEL; i = i + 1) begin
-                    w_src[i] <= 0; w_dst[i] <= 0; w_rem[i] <= 0;
+                    w_src[i] <= 0; w_dst[i] <= 0; w_rem[i] <= 0; w_spad_sel[i] <= 3'b000;
                     reg_status[i] <= 0;
                 end
                 M_AXI_ARVALID<=0; M_AXI_RREADY<=0;
@@ -254,6 +266,7 @@ module DMA_Controller #(
                         w_src[i]      <= cfg_src[i];
                         w_dst[i]      <= cfg_dst[i];
                         w_rem[i]      <= cfg_len[i];
+                        w_spad_sel[i] <= cfg_spad_sel[i]; // snapshot spad target
                         reg_status[i] <= 32'h1;         // BUSY
                         // Clear the START bit so we don't re-trigger
                         cfg_ctrl[i][0] <= 0;
@@ -345,10 +358,7 @@ module DMA_Controller #(
                             w_src[m_ch]      <= w_src[m_ch] + m_bytes;
                             w_dst[m_ch]      <= w_dst[m_ch] + m_bytes;
                             w_rem[m_ch]      <= w_rem[m_ch] - m_bytes;
-                            if (w_rem[m_ch] <= m_bytes)
-                                mst <= S_DONE;
-                            else
-                                mst <= S_RADDR;
+                            mst <= (w_rem[m_ch] <= m_bytes) ? S_DONE : S_RADDR;
                         end
                     end
          
@@ -364,5 +374,7 @@ module DMA_Controller #(
                 endcase
             end
         end
- 
+// M_SPAD_SEL is valid whenever the master FSM is in S_WDATA
+// top.sv uses this to route i_write_en to the correct SPAD
+assign M_SPAD_SEL = w_spad_sel[m_ch];
 endmodule
