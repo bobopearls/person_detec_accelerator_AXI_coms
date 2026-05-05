@@ -20,7 +20,8 @@
 // 0x30 CTRL -> [0] (route_en/START), [1] (reg_clear)
 // 0x34 STATUS -> [0] read_only, o_done
 // 0x38 quant_sh -> quantization right shift amount
-//
+// 0X40 DDR_STATUS, i_ddr_calib_done[0] from the MIG init_calib_compil
+// poll the DDR_STATUS before any DMA transfer
 // NOTE: quant_scale and quant_bias are NOT in the CSR.
 //       They are per-channel arrays stored in scale_spad and bias_spad,
 //       loaded by the DMA (spad_select=011 and 010), read by output router
@@ -31,11 +32,11 @@
 
 `timescale 1ns/1ps
 module systolic_csr #(
-    parameter DATA_WIDTH = 8,  // this is supposed to be SHIFT_WIDTH
-    parameter ADDR_WIDTH = 32,
+    parameter SHIFT_WIDTH = 8,
+    parameter ADDR_WIDTH = 32
     
-    parameter SCALE_WIDTH = 16, // width of the quant_scale, but this should come from the SPAD
-    parameter BIAS_WIDTH = 32   // width of the quant_bias 
+    //parameter SCALE_WIDTH = 16, // width of the quant_scale, but this should come from the SPAD
+    //parameter BIAS_WIDTH = 32   // width of the quant_bias 
 )(
     input wire clk, nrst,
     
@@ -61,7 +62,8 @@ module systolic_csr #(
 
     // --- Status input bit from the top.sv of the systolic array --- 
     input wire         i_done, // o_done signal, this is what the CPU will poll
-
+    input wire         i_ddr_calib_done, 
+    
     // --- Config Outputs, wire these to the top.sv ports ---
     output reg                    o_conv_mode,
     output reg  [1:0]             o_p_mode,
@@ -83,7 +85,7 @@ module systolic_csr #(
     output reg                    o_reg_clear,   // i_reg_clear (flush)
 
     // --- Quantization Outputs to top.sv systolic ---
-    output reg  [DATA_WIDTH-1:0]   o_quant_sh
+    output reg  [SHIFT_WIDTH-1:0]   o_quant_sh
     );
 
     // --- AXI Write ---
@@ -107,7 +109,7 @@ module systolic_csr #(
             o_w_start_addr <= 0; o_w_addr_end  <= 0;
             o_route_en     <= 0; o_reg_clear   <= 0;
             // Default matches hardcoded quant_sh in original top.sv
-            o_quant_sh <= {{(DATA_WIDTH-8){1'b0}}, 8'h05};
+            o_quant_sh <= {{(SHIFT_WIDTH-8){1'b0}}, 8'h05};
         end else begin
             s_axil_awready <= 0;
             s_axil_wready  <= 0;
@@ -147,8 +149,8 @@ module systolic_csr #(
                     // 6'h0D: STATUS, read only so ignore here for the writes
                     6'h0E: begin
                         // 0x38 where the CPU writes the shift amount (integer)
-                        // only the DATA_WIDTH bits are used, and the upper bits are ignored
-                        o_quant_sh        <= s_axil_wdata[DATA_WIDTH-1:0];     
+                        // only the SHIFT_WIDTH bits are used, and the upper bits are ignored
+                        o_quant_sh        <= s_axil_wdata[SHIFT_WIDTH-1:0];     
                     end
                     default: ; // no specific default, unmapped
                 endcase
@@ -189,8 +191,8 @@ module systolic_csr #(
                     6'h0B: s_axil_rdata <= {{(32-ADDR_WIDTH){1'b0}}, o_w_addr_end};
                     6'h0C: s_axil_rdata <= 32'd0;           // CTRL is write-only
                     6'h0D: s_axil_rdata <= {31'd0, i_done}; // STATUS — CPU polls here
-                    6'h0E: s_axil_rdata <= {{(32-DATA_WIDTH){1'b0}}, o_quant_sh};
-    
+                    6'h0E: s_axil_rdata <= {{(32-SHIFT_WIDTH){1'b0}}, o_quant_sh};
+                    6'h10: s_axil_rdata <= {31'd0, i_ddr_calib_done}; // 0x40, DDR ready!
                     default: s_axil_rdata <= 32'hB0BACAFE;  // unmapped, debug sentinel
                 endcase
                 s_axil_rresp  <= 2'b00;
