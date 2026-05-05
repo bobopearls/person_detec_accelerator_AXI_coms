@@ -17,7 +17,7 @@
 //   +0x08  BYTE_LEN  [31:0]   transfer length in bytes
 //   +0x0C  CTRL      [31:0]   bit0=START (auto-clears), bit1=reserved
 //   +0x10  STATUS    [31:0]   bit0=BUSY, bit1=DONE (W1C)
-//   +0x14  SPAD_SEL  o[2:0]   target SPAD for this transfer:
+//   +0x14  SPAD_SEL  [2:0]   target SPAD for this transfer:
 //                             000=weights 001=ifmaps 010=bias
 //                             011=scale   100=shift
 // Btw here is the reference for the initial set up: https://github.com/donlon/axi-dma-controller/tree/main
@@ -91,7 +91,23 @@ module DMA_Controller #(
         
         // SPAD select: valid during S_WDATA, tells top.sv which SPAD to write to
         // Encoding: 000=weights 001=ifmaps 010=bias 011=scale 100=shift
-        output wire [2:0]  M_SPAD_SEL
+        output wire [2:0]  M_SPAD_SEL,
+
+        // --- MIG 7 Series Signals ---
+        // WSTRB: write strobe: 1 bit per byte, all 1s = full beat valid
+        // Required by MIG AXI slave
+        output wire [DATA_WIDTH/8-1:0] M_AXI_WSTRB,
+
+        // AXI IDs: single master, all in-order, tied to zero
+        // MIG requires these even without out-of-order transactions
+        output wire [3:0]  M_AXI_ARID,
+        output wire [3:0]  M_AXI_AWID,
+        input  wire [3:0]  M_AXI_RID,   // returned by MIG, not used
+        input  wire [3:0]  M_AXI_BID,   // returned by MIG, not used
+
+        // DDR calibration done — do not fire any transfer until HIGH
+        // Connect to MIG init_calib_complete (~100us after reset)
+        input  wire        i_ddr_calib_done
     );
         // Constants 
         localparam BPB  = DATA_WIDTH / 8;           // bytes per beat = 8
@@ -261,8 +277,11 @@ module DMA_Controller #(
                 // ---- Start-bit detector: runs every cycle, for all channels ----
                 // Only accepts a new request if channel is not already pending/active
                 for (i = 0; i < NUM_CHANNEL; i = i + 1) begin
+                    // Guard: do not snapshot until DDR is ready
+                    // Without this the DMA hangs in S_RADDR forever
+                    // if fired before MIG init_calib_complete goes high
                     if (cfg_ctrl[i][0] && !pending[i] &&
-                        !(mst != S_IDLE && m_ch == i[1:0])) begin
+                        !(mst != S_IDLE && m_ch == i[1:0]) && i_ddr_calib_done) begin
                         w_src[i]      <= cfg_src[i];
                         w_dst[i]      <= cfg_dst[i];
                         w_rem[i]      <= cfg_len[i];
@@ -377,4 +396,13 @@ module DMA_Controller #(
 // M_SPAD_SEL is valid whenever the master FSM is in S_WDATA
 // top.sv uses this to route i_write_en to the correct SPAD
 assign M_SPAD_SEL = w_spad_sel[m_ch];
+
+// MIG compatibility: constant assignments
+// WSTRB: all bytes always valid, DMA only does full-beat writes
+assign M_AXI_WSTRB = {(DATA_WIDTH/8){1'b1}};  // 8'hFF for 64-bit bus
+
+// AXI IDs: single master, no out-of-order, tie to zero
+assign M_AXI_ARID  = 4'd0;
+assign M_AXI_AWID  = 4'd0;
+
 endmodule
